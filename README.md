@@ -38,44 +38,55 @@ uv sync
 ## 架构实现
 
 ### 1. 均方根归一化 (RMSNorm)
-
-**为什么需要归一化？**
-在深度学习模型的反向传播过程中，梯度的值往往与正向阶段的输入数据 $x$ 有关。当 $x$ 的绝对值过大或者过小，就容易引发**梯度爆炸**或**梯度消失**。因此，需要引入归一化（Normalization）操作，将数据特征放缩到一个稳定的尺度范围内（即让标准差变为 1），从而确保训练平稳收敛。
-
-**为什么选择 RMSNorm？**
-传统 Transformer 常用的是 LayerNorm（层归一化），而在这里被替换成了 RMSNorm（均方根归一化）。相比与 LayerNorm，**RMSNorm 直接舍弃了对均值的计算和去均值（中心化）的步骤**。在大规模模型的训练中，这样做可以极其显著地降低计算量、提升效率，而且其实际效果通常与 LayerNorm 不相上下甚至更好。
-
-**数学公式：**
-$$y_i = \frac{x_i}{\text{RMS}(x)} * \gamma_i$$
-其中：
-$$\text{RMS}(x) = \sqrt{\epsilon + \frac{1}{n} \sum_{i=1}^{n} x_i^2}$$
-*($\gamma_i$ 即代码中可学习的参数 `weight`，$\epsilon$ 是为了防止分母为0而设定的微小实数)*
-
 **代码实现：**
 ```python
 import torch
 import torch.nn as nn
 
 class RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
+    def __init__(self,dim,eps=1e-6):
         super().__init__()
-        # 输入的特征维度
-        self.hidden_size = hidden_size
-        # 防止除 0 的 epsilon 参数稳定性项
-        self.eps = eps
-        # 可学习的权重参数，初始化为全1，维度与特征维度保持一致
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        
-    def forward(self, x):
-        # 输入格式通常为 [batch_size, seq_length, hidden_size]
-        # .pow(2) 表示求平方；.mean(-1) 表示在最后一个维度(按 hidden_size 跨度)求均值。
-        # keepdim=True 保持截断前的张量维度不变，确保最后输出能够通过广播机制扩展（形状如 [batch_size, seq_length, 1]）。
-        variance = x.pow(2).mean(-1, keepdim=True)
-        
-        # 计算均方根倒数对输入直接相乘。
-        # torch.rsqrt 相当于计算 1.0 / torch.sqrt(variance + self.eps)，底层 C++ 计算更高效。
-        x = x * torch.rsqrt(variance + self.eps)
-        
-        # 乘以 RMSNorm 本身可学习的一维缩放权重
-        return self.weight * x
+        self.dim = dim #输入的特征维度
+        self.eps = eps #防止除0的epsilon参数
+        self.weight = nn.Parameter(torch.ones(dim)) #可学习的权重参数，初始化为全1，维度为输入特征维度
+    def _norm(self,x):
+        # 输入的格式为[batch_size, seq_length, hidden_size]; -1 表示对最后一个维度进行求均值，即对hidden_size维度求均值；keepdim=True保持维度不变，输出的格式为[batch_size, seq_length, 1]
+        #等价于 x / torch.sqrt(variance + self.eps)，对输入进行归一化处理，除以标准差
+        return x * torch.rsqrt(x.pow(2).mean(-1,keepdim=True) + self.eps)
+    def forward(self,x):
+        return self.weight * self._norm(x.float()).type_as(x) #乘以可学习的权重参数，.float()将输入转为32位浮点数，.type_as(x)将输出的类型转换回输入的类型
+
 ```
+
+### 2. 旋转位置编码 (RoPE)
+
+RoPE（Rotary Position Embedding）把“位置信息”变成对向量的**二维旋转**，并且只作用在 **Q / K** 上。
+这样在计算注意力相似度时，会自然地体现相对位移（更利于长文本建模）。
+
+本项目在 [model/model.py](model/model.py) 中实现了两步：
+
+- `precompute_freqs_cis(...)`：一次性预计算 `cos/sin` 查表（形状约为 `[max_seq_len, head_dim]`），避免每次 forward 重复计算三角函数
+- `apply_rotary_pos_emb(...)`：把 `cos/sin` 应用到 Q/K（采用“对半配对”的旋转实现）
+
+最小用法示意：
+```python
+freqs_cos, freqs_sin = precompute_freqs_cis(
+    dim=head_dim,
+    end=max_seq_len,
+    rope_base=rope_theta,
+    rope_scaling=rope_scaling,
+)
+
+# 按当前序列长度截取 cos/sin（增量推理时通常按 position 切片）
+q, k = apply_rotary_pos_emb(q, k, freqs_cos[:seq_len], freqs_sin[:seq_len])
+```
+
+### 3. YaRN（长上下文外推）
+
+当推理长度超过训练时的最大长度，原始 RoPE 可能出现外推不稳。YaRN 的核心思路是：
+
+- 高频维度保持不变（更关注局部信息）
+- 低频维度做缩放/内插（让旋转变慢以容纳更长上下文）
+- 中频维度用 ramp 做平滑过渡，并可通过 `attention_factor` 做注意力熵修正（代码里对应 `attn_factor`）
+
+在配置上：`SelfMiniMindConfig.inference_rope_scaling=True` 会生成 `rope_scaling` 字典，并在 `precompute_freqs_cis(...)` 中生效。
