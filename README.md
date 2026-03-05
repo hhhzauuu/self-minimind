@@ -90,3 +90,17 @@ q, k = apply_rotary_pos_emb(q, k, freqs_cos[:seq_len], freqs_sin[:seq_len])
 - 中频维度用 ramp 做平滑过渡，并可通过 `attention_factor` 做注意力熵修正（代码里对应 `attn_factor`）
 
 在配置上：`SelfMiniMindConfig.inference_rope_scaling=True` 会生成 `rope_scaling` 字典，并在 `precompute_freqs_cis(...)` 中生效。
+
+### 4. GQA (Grouped Query Attention) 与注意力计算
+
+GQA 是一种介于 MHA (多头注意力) 和 MQA (多查询注意力) 之间的优化方案：多个 Query (Q) 头共享同一组 Key (K) 和 Value (V) 头，在保持效果的同时大幅降低显存占用并提升推理速度。
+
+在 [model/model.py](model/model.py) 中的 `Attention` 模块融合了以下关键技术：
+
+- **张量重复计算：** 通过 `repeat_kv` 将较少头的 K、V 张量进行扩展补齐，以满足矩阵运算规则。
+- **并行与 KV Cache：** 推理阶段通过返回并传入 `past_kv`（KV Cache）来加速逐测生成；训练阶段则无需缓存，通过并行即可获取所有结果。
+- **Flash Attention 支持：** 当处于训练模式且张量长度允许时，启用加速计算模式，降低大规模矩阵导致显存爆炸的风险。
+- **双重掩码机制 (Mask)：**
+  - **因果掩码 (Causal Mask)：** 构建上三角掩码矩阵并在加到对应得分上（被设为 `-inf`），防自回归模型偷看"未来"词。
+  - **填充掩码 (Padding Mask)：** 针对无实义的 Padding token 给定趋于负无穷的手动偏移分数值（如 `-1e9`），确保注意力绝不被无效位置吸引。
+- **收尾投影：** 计算出多头结果后，经过维度转置、特征拼接展平，最后通过 `o_proj` 层混合所有注意力头进行特征投影输出。

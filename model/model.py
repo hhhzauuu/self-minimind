@@ -139,3 +139,105 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
     k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
     return q_embed, k_embed
+
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    因为GQA中K和V的数量比Q少，所以需要把K和V重复n_rep倍来匹配Q的数量，方便后续的矩阵运算。
+    """
+    #输入的形状为[batch_size, seq_length, num_key_value_heads, head_dim]。其中num_key_value_heads是K/V头的数量。
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1: #如果不需要重复，直接返回原始的K/V张量
+        return x
+    return (
+        # x[:, :, :, None, :]在num_key_value_heads和head_dim之间插入一个维度
+        # expand(bs, slen, num_key_value_heads, n_rep, head_dim)将这个新维度扩展为n_rep,这样就得到了一个形状为[batch_size, seq_length, num_key_value_heads, n_rep, head_dim]的张量.
+        # reshape(bs, slen, num_key_value_heads * n_rep, head_dim)将num_key_value_heads和n_rep这两个维度合并成一个维度
+        # num_key_value_heads * n_rep 相当于实现了K/V的重复，但不需要实际复制数据，节省内存和计算资源。
+        x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    )
+
+class Attention(nn.Module):
+    def __init__(self,args: SelfMiniMindConfig):
+        super().__init__()
+        self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads#
+        assert args.num_attention_heads % self.num_key_value_heads == 0 #Q的数量必须是K/V数量的整数倍。
+        self.n_local_heads = args.num_attention_heads #Q头的数量，
+        self.n_local_kv_heads = self.num_key_value_heads#K/V头的数量，
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads#KV需要重复的次数
+        self.head_dim = args.hidden_size // args.num_attention_heads#每个注意力头Q的维度,也就是hidden_size除以Q的个数
+        # 初始化QKV,注意KV的输出维度是num_key_value_heads * head_dim，跟Q不一样。
+        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # 最后的投影层，输入维度是num_attention_heads * head_dim，输出维度是hidden_size，这样才能和残差连接的输入维度匹配。
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
+        # 注意力的dropout层和残差连接的dropout层
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+        #是否使用Flash Attention的标志，加速计算。
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
+    
+    def forward(self,
+                x: torch.Tensor,
+                position_embeddings: Tuple[torch.Tensor, torch.Tensor],  # 修改为接收cos和sin表
+                past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,#kvcache
+                use_cache=False,#要不要把当前的K/V放到cache里
+                attention_mask: Optional[torch.Tensor] = None):
+        bsz, seq_len, _ = x.shape #这个时候输入的形状为[batch_size, seq_length, hidden_size]
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x) #分别通过线性层得到Q、K、V的形状。
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+
+        # 从输入的position_embeddings中解包出预计算的cos和sin表，形状都是[seq_len, head_dim]，position_embeddings具体怎么获取的是在外层model上实现的,不是attention层考虑的。
+        cos, sin = position_embeddings 
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin) #经过RoPE得到带有位置信息的QK
+
+        # kv_cache实现
+        if past_key_value is not None: # 如果传入了历史缓存，说明正在逐字生成，需要把当前的KV和历史的拼接起来。
+            xk = torch.cat([past_key_value[0], xk], dim=1)# 在dim=1的维度上拼接，也就是seq_len的维度.
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        past_kv = (xk, xv) if use_cache else None #如果开关是打开的，就把新的KV放到cache
+
+        # 调整qkv的维度，并对kv进行复制
+        # xq的形状是[batch_size, seq_length, num_attention_heads, head_dim]，需要转置成[batch_size, num_attention_heads, seq_length, head_dim]，因为后续的运算是对每个注意力头独立进行的。
+        xq, xk, xv = (
+            xq.transpose(1, 2),
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2)
+        )
+
+        # 当满足使用Flash Attention的条件时，且输入序列长度大于1，且没有历史KV缓存，且没有掩码。才能用Flash Attention。
+        # 大模型在训练时，不是逐字生成的，而是整段文字的并行生成。所以就不需要KV cache。
+        # 这么就容易出现显存爆炸问题，而Flash Attention可以降低显存占用。
+        if self.flash and (seq_len > 1) and (past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        else:
+            '''
+            此时的张量形状为：
+            xq: [batch_size, num_attention_heads, seq_length, head_dim],记为[B, H, L, D]
+            PyTorch 会自动保留前两个维度（B和H）作为批处理并行计算，只对最后两个维度做矩阵乘法
+            '''
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) # （L,D) @ (D,L) -> (L,L)。scores的形状是[B,H,L,L]
+            # 这里是做的因果掩码 causal mask。因为这是自回归模型
+            # torch.full((seq_len, seq_len), float("-inf"))：先造一个L*L的矩阵，里面全是负无穷
+            # torch.triu(..., diagonal=1)：triu 意思是 Upper Triangle（上三角）。它把刚刚那个矩阵的下半部分变成0，只保留对角线及右上方的负无穷；diagonal=1表示 0往上移一行，也就是对角线也是0
+            scores[:, :, :, -seq_len:] += torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=scores.device), diagonal=1)
+            
+            # 这里是padding掩码，因为输入的序列可能有padding部分，这些部分不应该对注意力计算产生影响，所以要把它们的分数设置为负无穷。 
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                scores = scores + extended_attention_mask
+
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = scores @ xv
+
+        # 拼接多个注意力头
+        # output的形状是[B,H,L,D]，需要转置回[B,L,H,D]，然后再reshape成[B,L,H*D]，也就是[B,L,hidden_size]，这样才能和残差连接的输入维度匹配。
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output)) #先通过线性层投影,然后再dropout
+        return output, past_kv #返回输出和新的KV缓存
