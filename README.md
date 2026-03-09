@@ -35,72 +35,115 @@ uv sync
 ```
 *(如果是 Linux / macOS 系统，请使用 `source .venv/bin/activate`)*
 
-## 架构实现
+## 快速理解
 
-### 1. 均方根归一化 (RMSNorm)
-**代码实现：**
+`self-minimind` 是一个面向学习的大模型极简实现，主干代码集中在 [model/model.py](model/model.py)。
+
+整体数据流可以概括为：
+
+`input_ids -> nn.Embedding -> N x SelfMiniMindBlock -> RMSNorm -> lm_head -> logits`
+
+其中：
+
+- `SelfMiniMindBlock`：由 `GQA Attention + FFN(SwiGLU)` 组成，采用 Pre-Norm 和残差连接。
+- `RoPE / YaRN`：负责位置编码和长上下文外推。
+- `KV Cache`：用于推理阶段复用历史 K/V，加速逐 token 生成。
+
+## 核心组件
+
+### 1. RMSNorm
+
+使用 RMSNorm 代替 LayerNorm，减少计算量并提升大模型训练与推理效率。
+
+### 2. RoPE + YaRN
+
+- `precompute_freqs_cis(...)`：预计算 RoPE 所需的 `cos/sin` 表。
+- `apply_rotary_pos_emb(...)`：把位置编码应用到 Q/K。
+- `inference_rope_scaling=True` 时启用 YaRN 风格的频率缩放，用于更长上下文推理。
+
+### 3. GQA Attention
+
+注意力模块采用 GQA（Grouped Query Attention）：Q 头数多于 K/V 头数，通过 `repeat_kv(...)` 把较少的 K/V 头扩展到与 Q 匹配。
+
+实现上同时支持：
+
+- 因果掩码与 padding 掩码
+- 推理用的 `past_key_values`
+- 条件满足时走 `scaled_dot_product_attention` 路径
+
+### 4. FFN (SwiGLU)
+
+FFN 采用 SwiGLU 风格结构：
+
+- `gate_proj` 生成门控信号
+- `up_proj` 提供候选特征
+- 两路特征逐元素相乘后，再通过 `down_proj` 投回 `hidden_size`
+
+`intermediate_size` 默认取约 $\frac{8}{3} \cdot hidden\_size$，这是为了在使用三层线性映射时保持参数量大致稳定。
+
+## 模型结构
+
+### SelfMiniMindBlock
+
+每个 Block 的计算顺序是：
+
+`RMSNorm -> Attention -> Residual -> RMSNorm -> FFN -> Residual`
+
+对应公式：
+
+$$
+h_1 = x + Attention(RMSNorm(x))
+$$
+
+$$
+h_2 = h_1 + FFN(RMSNorm(h_1))
+$$
+
+### SelfMiniMindModel
+
+`SelfMiniMindModel` 是主干网络，只负责输出上下文化后的隐藏状态，不直接输出词表概率。
+
+当前接口与 [model/model.py](model/model.py) 保持一致：
+
 ```python
-import torch
-import torch.nn as nn
-
-class RMSNorm(nn.Module):
-    def __init__(self,dim,eps=1e-6):
-        super().__init__()
-        self.dim = dim #输入的特征维度
-        self.eps = eps #防止除0的epsilon参数
-        self.weight = nn.Parameter(torch.ones(dim)) #可学习的权重参数，初始化为全1，维度为输入特征维度
-    def _norm(self,x):
-        # 输入的格式为[batch_size, seq_length, hidden_size]; -1 表示对最后一个维度进行求均值，即对hidden_size维度求均值；keepdim=True保持维度不变，输出的格式为[batch_size, seq_length, 1]
-        #等价于 x / torch.sqrt(variance + self.eps)，对输入进行归一化处理，除以标准差
-        return x * torch.rsqrt(x.pow(2).mean(-1,keepdim=True) + self.eps)
-    def forward(self,x):
-        return self.weight * self._norm(x.float()).type_as(x) #乘以可学习的权重参数，.float()将输入转为32位浮点数，.type_as(x)将输出的类型转换回输入的类型
-
-```
-
-### 2. 旋转位置编码 (RoPE)
-
-RoPE（Rotary Position Embedding）把“位置信息”变成对向量的**二维旋转**，并且只作用在 **Q / K** 上。
-这样在计算注意力相似度时，会自然地体现相对位移（更利于长文本建模）。
-
-本项目在 [model/model.py](model/model.py) 中实现了两步：
-
-- `precompute_freqs_cis(...)`：一次性预计算 `cos/sin` 查表（形状约为 `[max_seq_len, head_dim]`），避免每次 forward 重复计算三角函数
-- `apply_rotary_pos_emb(...)`：把 `cos/sin` 应用到 Q/K（采用“对半配对”的旋转实现）
-
-最小用法示意：
-```python
-freqs_cos, freqs_sin = precompute_freqs_cis(
-    dim=head_dim,
-    end=max_seq_len,
-    rope_base=rope_theta,
-    rope_scaling=rope_scaling,
+hidden_states, presents = model(
+    input_ids,
+    attention_mask=None,
+    past_key_values=None,
+    use_cache=False,
 )
-
-# 按当前序列长度截取 cos/sin（增量推理时通常按 position 切片）
-q, k = apply_rotary_pos_emb(q, k, freqs_cos[:seq_len], freqs_sin[:seq_len])
 ```
 
-### 3. YaRN（长上下文外推）
+返回值说明：
 
-当推理长度超过训练时的最大长度，原始 RoPE 可能出现外推不稳。YaRN 的核心思路是：
+- `hidden_states`：最后一层的隐藏表示
+- `presents`：每层更新后的 KV Cache
 
-- 高频维度保持不变（更关注局部信息）
-- 低频维度做缩放/内插（让旋转变慢以容纳更长上下文）
-- 中频维度用 ramp 做平滑过渡，并可通过 `attention_factor` 做注意力熵修正（代码里对应 `attn_factor`）
+### SelfMiniMindForCausalLM
 
-在配置上：`SelfMiniMindConfig.inference_rope_scaling=True` 会生成 `rope_scaling` 字典，并在 `precompute_freqs_cis(...)` 中生效。
+`SelfMiniMindForCausalLM` 在主干外加上语言模型头 `lm_head`，负责把 `[B, L, H]` 映射到 `[B, L, V]`，并在训练时计算 next-token prediction 的交叉熵损失。
 
-### 4. GQA (Grouped Query Attention) 与注意力计算
+当前接口与 [model/model.py](model/model.py) 保持一致：
 
-GQA 是一种介于 MHA (多头注意力) 和 MQA (多查询注意力) 之间的优化方案：多个 Query (Q) 头共享同一组 Key (K) 和 Value (V) 头，在保持效果的同时大幅降低显存占用并提升推理速度。
+```python
+output = model(
+    input_ids,
+    attention_mask=None,
+    labels=None,
+    past_key_values=None,
+    use_cache=False,
+    logits_to_keep=0,
+)
+```
 
-在 [model/model.py](model/model.py) 中的 `Attention` 模块融合了以下关键技术：
+其中：
 
-- **张量重复计算：** 通过 `repeat_kv` 将较少头的 K、V 张量进行扩展补齐，以满足矩阵运算规则。
-- **并行与 KV Cache：** 推理阶段通过返回并传入 `past_kv`（KV Cache）来加速逐测生成；训练阶段则无需缓存，通过并行即可获取所有结果。
-- **Flash Attention 支持：** 当处于训练模式且张量长度允许时，启用加速计算模式，降低大规模矩阵导致显存爆炸的风险。
-- **双重掩码机制 (Mask)：**
-  - **因果掩码 (Causal Mask)：** 构建上三角掩码矩阵并在加到对应得分上（被设为 `-inf`），防自回归模型偷看"未来"词。
-  - **填充掩码 (Padding Mask)：** 针对无实义的 Padding token 给定趋于负无穷的手动偏移分数值（如 `-1e9`），确保注意力绝不被无效位置吸引。
-- **收尾投影：** 计算出多头结果后，经过维度转置、特征拼接展平，最后通过 `o_proj` 层混合所有注意力头进行特征投影输出。
+- `labels` 不为 `None` 时计算 loss
+- `logits_to_keep` 用于只保留部分位置的 logits
+- 返回值是 `CausalLMOutputWithPast`
+
+另外，`embed_tokens.weight` 与 `lm_head.weight` 做了权重共享，以减少参数量并保持输入嵌入与输出投影的一致性。
+
+## 更多说明
+
+如果你想看更详细的推导、公式说明和逐段代码笔记，可以直接看 [doc/学习日志.md](doc/学习日志.md)。

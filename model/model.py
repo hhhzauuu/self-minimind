@@ -241,3 +241,162 @@ class Attention(nn.Module):
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output)) #先通过线性层投影,然后再dropout
         return output, past_kv #返回输出和新的KV缓存
+
+class FeedForward(nn.Module):
+    def __init__(self, config: SelfMiniMindConfig):
+        super().__init__()
+        
+        # intermediate_size是FFN中间层的维度。
+        # 在传统transformer中，中间层一般是隐藏层的4倍。为了保证总参数量不变，在swiglu中，intermediate_size=hidden_size * 8/3
+        # 为了提高gpu并行效率，intermediate_size需要是64的倍数，所以这里做了一个调整，向上取整到最近的64的倍数。
+        if config.intermediate_size is None:
+            intermediate_size = int(config.hidden_size * 8 / 3)
+            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+        
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)# 右侧门控线性层
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)# 降维线性层
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False) # 左侧升维线性层
+        self.dropout = nn.Dropout(config.dropout)
+        self.act_fn = ACT2FN[config.hidden_act] #利用字典根据配置文件的字符串名称，找到对应的激活函数
+
+    def forward(self, x):
+        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
+
+
+class SelfMiniMindBlock(nn.Module):
+    def __init__(self, layer_id: int, config: SelfMiniMindConfig):#layer_id是当前块在整个模型的第几块
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads # Q的数量，它其实是为了下面计算head_dim准备的
+        self.hidden_size = config.hidden_size
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.self_attn = Attention(config) # 算出来注意力
+
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps) # 这里指的是GQA模块前的RMSNorm，也就是pre-norm，并没有在模块内实现。
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps) #GQA模块后的RMSNorm,也就是FFN模块前的RMSNorm
+        # self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        self.mlp = FeedForward(config)
+
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        '''
+        hidden_states:当前批次的所有词向量数据，形状为[batch_size, seq_len, hidden_size
+        position_embeddings：预计算的RoPE位置编码表，包含cos和sin两部分，形状都是[seq_len, head_dim]
+        '''
+        residual = hidden_states # 备份，为做残差连接做准备
+        hidden_states, present_key_value = self.self_attn( #经过注意力层(pre-norm)，得到新的hidden_states和新的KV缓存
+            self.input_layernorm(hidden_states), position_embeddings,
+            past_key_value, use_cache, attention_mask
+        )
+        hidden_states += residual # 残差连接
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states)) # pre-norm -> FFN -> 残差连接
+        return hidden_states, present_key_value #返回当前块的输出和新的KV缓存，供下一块使用
+    
+
+class SelfMiniMindModel(nn.Module):
+    def __init__(self, config: SelfMiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers #vocab_size是词表大小，num_hidden_layers是transformer块的数量
+        
+        # 注意这里的Embedding,里面不是BGE这种Embedding模型，而是随机的权重矩阵，需要大模型的训练。
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size) #词嵌入层，输入是token id（是对输入的文本分词后的索引）形状为[batch_size, seq_len]，输出是对应的词向量，形状为[batch_size, seq_len, hidden_size]
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([SelfMiniMindBlock(l, config) for l in range(self.num_hidden_layers)]) #创建了一个长度为 num_hidden_layers 的列表，每个元素都是一个 SelfMiniMindBlock
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps) #每个block都有pre-norm，等所有的block结束后，还有一个全局的RMSNorm，作用是对整个模型的输出做归一化处理，稳定训练。
+
+        # 生成 RoPE 位置编码表，每个注意力头独立计算，所以维度是hidden_size // num_attention_heads
+        freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
+                                                    end=config.max_position_embeddings, rope_base=config.rope_theta,#end是预计算的最大位置，rope_base是RoPE的基数
+                                                    rope_scaling=config.rope_scaling)#是否启用长上下文的 RoPE 缩放策略,yarn
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False) #把 cos 表注册成 buffer，buffer 的含义是：它属于模型,会随着 model.to(device) 自动搬到 GPU；但它不是可训练参数，不参与梯度更新。
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(self,
+                input_ids: Optional[torch.Tensor] = None,#输入的token id，形状为[batch_size, seq_len]
+                attention_mask: Optional[torch.Tensor] = None,#padding掩码，形状为[batch_size, seq_len】
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,#历史KVcache列表，列表长度为transformer块的数量，每个元素是一个元组，包含K和V的张量，形状分别为[batch_size, seq_len,num_key_value_heads, head_dim]
+                use_cache: bool = False,
+                **kwargs):
+        batch_size, seq_length = input_ids.shape
+        if hasattr(past_key_values, 'layers'): past_key_values = None #如果传进来的不是列表，而是layers对象，就视作none
+        past_key_values = past_key_values or [None] * len(self.layers)
+
+        # 看列表第一层的KV缓存，如果不空，说明正在逐字生成，那么start_pos就等于历史缓存的长度，也就是已经生成的序列长度；如果空，说明是并行生成，start_pos就从0开始。
+        # 已经生成的序列长度怎么看？通过past_key_values的第一层，也就是past_key_values[0]，找到这个元组的第一个元素（也就是K)的长度seq_len就好
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        
+        # 初始的特征，也就是输入transformer块的词向量。
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        position_embeddings = ( # 从预计算好的表里面，取出来和输入序列匹配的部分。
+            # 同一个position只和当前位置有关系，所以会被所有block共享
+            self.freqs_cos[start_pos:start_pos + seq_length],
+            self.freqs_sin[start_pos:start_pos + seq_length]
+        )
+
+        presents = [] #存放新的kvcache
+        for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)): # 遍历每个transformer块，调用它的forward方法。
+            hidden_states, present = layer( #调用了block的forward方法！
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask
+            )
+            presents.append(present) #更新kvcache
+
+        hidden_states = self.norm(hidden_states)# 最后一个全局的rmsnorm
+
+        # aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
+        # return hidden_states, presents, aux_loss
+        return hidden_states, presents #注意这里要返回的不只是输出的hidden_states，还有新的KV缓存presents! 
+    
+class SelfMiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = SelfMiniMindConfig
+
+    def __init__(self, config: SelfMiniMindConfig = None):
+        self.config = config or SelfMiniMindConfig()
+        super().__init__(self.config)
+        self.model = SelfMiniMindModel(self.config) #主干网络，输出的是隐藏状态hidden_states
+        
+        # 语言模型头，就是把隐藏状态映射到词表大小的线性层。[B,L,H]->[B,L,V]
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        # 权重共享。为什么不需要转置？embed_tokens的形状为[vocab_size, hidden_size]，lm_head的权重形状为[hidden_size, vocab_size]
+        # 但是在pytorch中，线性层的权重是[out_features, in_features]，也就是[vocab_size, hidden_size]，所以它们的形状是一样的，可以直接赋值共享权重。
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+    def forward(self,
+                input_ids: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                labels: Optional[torch.Tensor] = None, # 训练标签，形状为[batch_size, seq_len]
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                use_cache: bool = False,
+                logits_to_keep: Union[int, torch.Tensor] = 0, #保留哪些logits
+                **args):
+        hidden_states, past_key_values = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args
+        )
+
+        # 取出要保留的logits部分
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :]) #[B,L',H] -> [B,L',V]
+
+        loss = None # 推理时没有损失
+        if labels is not None: 
+            '''
+            因为自回归语言模型的训练目标是预测下一个词，所以在计算交叉熵损失时，输入的logits需要去掉最后一个时间步（因为它没有对应的标签），而labels需要去掉第一个时间步（因为它没有对应的输入）。这样就实现了对齐。
+            '''
+            shift_logits = logits[..., :-1, :].contiguous() #contiguous()的作用是确保在内存中是连续存储的，这样才能正确地调用view()方法进行reshape。
+            shift_labels = labels[..., 1:].contiguous()
+
+            # 计算交叉熵损失
+            # shift_logits的形状是[B, L-1, V]-> [B*(L-1), V]，shift_labels的形状是[B, L-1] -> [B*(L-1)]，这样就满足了交叉熵损失函数的输入要求。
+            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
+        # 把输出打包，符合huggingface接口规范
+        output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
+        # output.aux_loss = aux_loss
+        return output
