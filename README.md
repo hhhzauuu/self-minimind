@@ -1,149 +1,88 @@
 # self-minimind
-从0到1学习大模型。
 
-## 环境配置
+从0到1学习大模型的极简实现，当前代码聚焦在核心 Transformer 组件复现与预训练链路打通。
 
-本项目推荐使用 `uv` 进行依赖和虚拟环境管理。请按照以下步骤配置开发环境：
+## 环境
 
-### 1. 安装 uv
-如果你还没有安装 `uv`，可以通过 pip 进行安装：
-```bash
-pip install uv
-```
+项目推荐使用 `uv` 管理依赖和虚拟环境：
 
-### 2. 初始化 uv 环境
-初始化项目并指定使用的 Python 版本：
-```bash
-uv init -p 3.12
-```
-
-### 3. 修改依赖配置（注意保存）
-在 `pyproject.toml` 文件中修改 `dependencies` 字段以添加你需要的依赖包。
-**修改完毕后，请务必保存文件！！！**
-
-### 4. 安装/同步环境
-运行以下命令，`uv` 会根据配置文件自动下载第三方库并创建 `.venv` 虚拟环境：
 ```bash
 uv sync
 ```
-*(更推荐直接使用 `uv add package_name`，它会自动修改配置文件、安装依赖并更新环境文件。)*
 
-### 5. 激活环境
-配置完成后，激活虚拟环境开始开发：
+Windows：
+
 ```powershell
 .venv\Scripts\activate
 ```
-*(如果是 Linux / macOS 系统，请使用 `source .venv/bin/activate`)*
 
-## 快速理解
+Linux / macOS：
 
-`self-minimind` 是一个面向学习的大模型极简实现，主干代码集中在 [model/model.py](model/model.py)。
+```bash
+source .venv/bin/activate
+```
 
-整体数据流可以概括为：
+如果缺少额外依赖，可以直接补装：
+
+```bash
+uv add datasets transformers torch swanlab
+```
+
+## 代码结构
+
+- [model/self_minimind.py](model/self_minimind.py)：模型主干与配置，包含 `SelfMiniMindConfig`、RMSNorm、RoPE/YaRN、GQA、SwiGLU 风格 FFN、`SelfMiniMindModel`、`SelfMiniMindForCausalLM`。
+- [dataset/lm_dataset.py](dataset/lm_dataset.py)：预训练数据集定义，把 `{"text": ...}` 样本转成 `input_ids` 与 `labels`。
+- [trainer/train_pretrain.py](trainer/train_pretrain.py)：预训练入口，支持 AMP、梯度累积、DDP、断点续训和 SwanLab 日志记录。
+- [trainer/trainer_utils.py](trainer/trainer_utils.py)：学习率调度、模型初始化、checkpoint、分布式辅助函数。
+- [doc/学习日志.md](doc/学习日志.md)：更完整的公式推导、代码笔记和训练流程记录。
+
+## 模型概览
+
+整体数据流如下：
 
 `input_ids -> nn.Embedding -> N x SelfMiniMindBlock -> RMSNorm -> lm_head -> logits`
 
-其中：
+可以把当前模型理解成两层：
 
-- `SelfMiniMindBlock`：由 `GQA Attention + FFN(SwiGLU)` 组成，采用 Pre-Norm 和残差连接。
-- `RoPE / YaRN`：负责位置编码和长上下文外推。
-- `KV Cache`：用于推理阶段复用历史 K/V，加速逐 token 生成。
+- `SelfMiniMindModel`：负责主干网络计算。它把 `input_ids` 先映射成词向量，然后依次通过多层 `SelfMiniMindBlock`，最后输出上下文化后的 `hidden_states`。
+- `SelfMiniMindForCausalLM`：在主干外再接一个 `lm_head`，把 `hidden_states` 投影到词表维度，得到 `logits`，并在训练时计算 next-token prediction 的 loss。
 
-## 核心组件
+单个 `SelfMiniMindBlock` 采用的是比较典型的 Pre-Norm 结构：先做 `RMSNorm`，再进入 GQA Attention，接着做残差连接；随后再经过一次 `RMSNorm`、SwiGLU 风格 FFN 和第二次残差连接。推理阶段还支持 `past_key_values`，也就是常见的 KV Cache。
 
-### 1. RMSNorm
+当前实现的关键点：
 
-使用 RMSNorm 代替 LayerNorm，减少计算量并提升大模型训练与推理效率。
+- Pre-Norm Transformer Block
+- RoPE 位置编码，并预留 YaRN 长上下文外推能力
+- GQA 注意力机制
+- SwiGLU 风格 FFN
+- `embed_tokens.weight` 与 `lm_head.weight` 权重共享
 
-### 2. RoPE + YaRN
+## 预训练快速开始
 
-- `precompute_freqs_cis(...)`：预计算 RoPE 所需的 `cos/sin` 表。
-- `apply_rotary_pos_emb(...)`：把位置编码应用到 Q/K。
-- `inference_rope_scaling=True` 时启用 YaRN 风格的频率缩放，用于更长上下文推理。
+1. 将 `pretrain_hq.jsonl` 放到仓库根目录的 `dataset/` 下。
+2. 确保 `model/` 目录下至少有 `tokenizer_config.json`；如果同时有 `tokenizer.json`，分词会更快。
+3. 如果要记录训练日志，先执行 `swanlab login`。
+4. 进入 `trainer/` 目录再启动训练。当前脚本默认使用 `../model`、`../dataset`、`../out` 等相对路径，在 `trainer/` 目录下执行最稳妥。
 
-### 3. GQA Attention
+单卡示例：
 
-注意力模块采用 GQA（Grouped Query Attention）：Q 头数多于 K/V 头数，通过 `repeat_kv(...)` 把较少的 K/V 头扩展到与 Q 匹配。
-
-实现上同时支持：
-
-- 因果掩码与 padding 掩码
-- 推理用的 `past_key_values`
-- 条件满足时走 `scaled_dot_product_attention` 路径
-
-### 4. FFN (SwiGLU)
-
-FFN 采用 SwiGLU 风格结构：
-
-- `gate_proj` 生成门控信号
-- `up_proj` 提供候选特征
-- 两路特征逐元素相乘后，再通过 `down_proj` 投回 `hidden_size`
-
-`intermediate_size` 默认取约 $\frac{8}{3} \cdot hidden\_size$，这是为了在使用三层线性映射时保持参数量大致稳定。
-
-## 模型结构
-
-### SelfMiniMindBlock
-
-每个 Block 的计算顺序是：
-
-`RMSNorm -> Attention -> Residual -> RMSNorm -> FFN -> Residual`
-
-对应公式：
-
-$$
-h_1 = x + Attention(RMSNorm(x))
-$$
-
-$$
-h_2 = h_1 + FFN(RMSNorm(h_1))
-$$
-
-### SelfMiniMindModel
-
-`SelfMiniMindModel` 是主干网络，只负责输出上下文化后的隐藏状态，不直接输出词表概率。
-
-当前接口与 [model/model.py](model/model.py) 保持一致：
-
-```python
-hidden_states, presents = model(
-    input_ids,
-    attention_mask=None,
-    past_key_values=None,
-    use_cache=False,
-)
+```powershell
+Set-Location .\trainer
+python train_pretrain.py --data_path ../dataset/pretrain_hq.jsonl --use_wandb
 ```
 
-返回值说明：
+多卡示例：
 
-- `hidden_states`：最后一层的隐藏表示
-- `presents`：每层更新后的 KV Cache
-
-### SelfMiniMindForCausalLM
-
-`SelfMiniMindForCausalLM` 在主干外加上语言模型头 `lm_head`，负责把 `[B, L, H]` 映射到 `[B, L, V]`，并在训练时计算 next-token prediction 的交叉熵损失。
-
-当前接口与 [model/model.py](model/model.py) 保持一致：
-
-```python
-output = model(
-    input_ids,
-    attention_mask=None,
-    labels=None,
-    past_key_values=None,
-    use_cache=False,
-    logits_to_keep=0,
-)
+```powershell
+Set-Location .\trainer
+torchrun --nproc_per_node=2 train_pretrain.py --data_path ../dataset/pretrain_hq.jsonl
 ```
 
-其中：
+补充说明：
 
-- `labels` 不为 `None` 时计算 loss
-- `logits_to_keep` 用于只保留部分位置的 logits
-- 返回值是 `CausalLMOutputWithPast`
+- 当前脚本默认使用 `bfloat16` 自动混合精度。
+- `--use_moe` 目前仅保留为兼容参数，当前训练固定使用普通 FFN，不启用 MoE。
 
-另外，`embed_tokens.weight` 与 `lm_head.weight` 做了权重共享，以减少参数量并保持输入嵌入与输出投影的一致性。
+## 学习资料
 
-## 更多说明
-
-如果你想看更详细的推导、公式说明和逐段代码笔记，可以直接看 [doc/学习日志.md](doc/学习日志.md)。
+如果想看更详细的推导、代码逐段解释和工程实践记录，可以直接阅读 [doc/学习日志.md](doc/学习日志.md)。
