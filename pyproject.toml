@@ -5,8 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "datasets>=4.7.0",
     "numpy>=2.3.4",
     "pandas>=2.3.3",
+    "swanlab>=0.7.11",
     "torch>=2.9.0",
     "transformers>=4.57.1",
 ]
