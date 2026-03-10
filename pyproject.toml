@@ -6,9 +6,14 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "datasets>=4.7.0",
+    "modelscope>=1.34.0",
     "numpy>=2.3.4",
     "pandas>=2.3.3",
     "swanlab>=0.7.11",
     "torch>=2.9.0",
     "transformers>=4.57.1",
 ]
+[[tool.uv.index]]
+name = "aliyun"
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true

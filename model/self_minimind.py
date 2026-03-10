@@ -48,15 +48,24 @@ class SelfMiniMindConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
         self.inference_rope_scaling = inference_rope_scaling
-        self.flash_attention = flash_attention
-        self.use_moe = use_moe
-        self.num_experts_per_tok = num_experts_per_tok
-        self.n_routed_experts = n_routed_experts
-        self.n_shared_experts = n_shared_experts
-        self.seq_aux = seq_aux
-        self.norm_topk_prob = norm_topk_prob
-        self.aux_loss_alpha = aux_loss_alpha
-        self.scoring_func = scoring_func
+        # self.flash_attention = flash_attention
+        self.flash_attn = flash_attention
+        # self.use_moe = use_moe
+        # self.num_experts_per_tok = num_experts_per_tok
+        # self.n_routed_experts = n_routed_experts
+        # self.n_shared_experts = n_shared_experts
+        # self.seq_aux = seq_aux
+        # self.norm_topk_prob = norm_topk_prob
+        # self.aux_loss_alpha = aux_loss_alpha
+        # self.scoring_func = scoring_func
+        self.use_moe = False
+        self.num_experts_per_tok = 0
+        self.n_routed_experts = 0
+        self.n_shared_experts = 0
+        self.seq_aux = False
+        self.norm_topk_prob = False
+        self.aux_loss_alpha = 0.0
+        self.scoring_func = "softmax"
 
         self.rope_scaling = (
             {
@@ -177,7 +186,8 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
         #是否使用Flash Attention的标志，加速计算。
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
+        flash_enabled = getattr(args, 'flash_attention', getattr(args, 'flash_attn', False))
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and flash_enabled
     
     def forward(self,
                 x: torch.Tensor,
