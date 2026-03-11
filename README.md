@@ -1,6 +1,18 @@
 # self-minimind
 
-从0到1学习大模型的极简实现，当前代码聚焦在核心 Transformer 组件复现与预训练链路打通。
+从 0 到 1 学习大模型的极简实现路径。
+小白如何学会并使用 minimind？本项目将为你提供答案。
+
+- 参考项目：[minimind](https://github.com/jingyaogong/minimind)
+- 参考视频：[Bilibili: 2小时带你从0手搓一个能在笔记本上运行的GPT大模型](https://www.bilibili.com/video/BV1T2k6BaEeC/?share_source=copy_web&vd_source=2fca6e2667a11ddcb7554d3ef302d0ff)
+
+本项目致力于提供一条清晰、极简的大语言模型（LLM）学习与落地路径。项目深度参考了优秀的开源工程 MiniMind 及其配套教学视频。
+
+与单纯的代码复现不同，本项目最大的特色在于系统性地补齐了原项目背后的底层基础知识（涵盖 Transformer 架构细节、RoPE 位置编码、KV Cache 机制以及 SwiGLU 等核心组件）。旨在帮助学习者跨越理论壁垒，不仅能把代码“跑通”，更能真正透彻掌握模型原理，从底层逻辑出发，亲手搭建出完全属于自己的大模型。
+
+如果你想看更详细的推导、代码逐段解释和工程实践记录，可以直接阅读：[doc/学习日志.md](doc/学习日志.md)。
+
+另外，如果想看简单易懂的 Hot 100 题解，请看：[doc/hot100刷题.md](doc/hot100刷题.md)。
 
 ## 环境
 
@@ -38,24 +50,34 @@ uv add datasets transformers torch swanlab
 
 ## 模型概览
 
+整体数据流与架构可以参考下图：
+
+<!-- 架构图来自学习日志 -->
+![](https://cdn.nlark.com/yuque/0/2026/png/51029207/1772507093889-fb4e973c-c453-4259-84fb-bb6039de658e.png)
+
 整体数据流如下：
 
 `input_ids -> nn.Embedding -> N x SelfMiniMindBlock -> RMSNorm -> lm_head -> logits`
 
-可以把当前模型理解成两层：
+本项目模型结构可以从宏观上理解为两层封装：
 
-- `SelfMiniMindModel`：负责主干网络计算。它把 `input_ids` 先映射成词向量，然后依次通过多层 `SelfMiniMindBlock`，最后输出上下文化后的 `hidden_states`。
-- `SelfMiniMindForCausalLM`：在主干外再接一个 `lm_head`，把 `hidden_states` 投影到词表维度，得到 `logits`，并在训练时计算 next-token prediction 的 loss。
+- `SelfMiniMindModel`：负责主干网络计算。它将输入的单词索引 `input_ids` 映射成稠密的词向量（Embedding），随后依次通过 $K$ 层堆叠的 Transformer 层（即 `SelfMiniMindBlock`）。它的核心作用是提炼并融合上下文信息，最后输出上下文感知后的向量表示 `hidden_states`。
+- `SelfMiniMindForCausalLM`：这是自回归语言模型（Causal LM）的头部封装。在执行完主干网络的计算后，利用线性映射层 `lm_head` 将提取出的 `hidden_states` 映射回完整的词表维度之上，从而得到每个可能词汇被生成的预测得分（`logits`）。在训练阶段，模型会据此和真实标签计算 Next-Token Prediction（预测下一个词）的交叉熵损失。
 
-单个 `SelfMiniMindBlock` 采用的是比较典型的 Pre-Norm 结构：先做 `RMSNorm`，再进入 GQA Attention，接着做残差连接；随后再经过一次 `RMSNorm`、SwiGLU 风格 FFN 和第二次残差连接。推理阶段还支持 `past_key_values`，也就是常见的 KV Cache。
+而在微观层面，单个 `SelfMiniMindBlock` 采用了目前业界主流的前置归一化（Pre-Norm）结构：
+1. **输入阶段**：数据首先经历 `RMSNorm` 均方根归一化。
+2. **注意力机制**：经过归一化后的隐状态进入 **GQA (Grouped Query Attention)** 进行分组多头注意力计算。该过程结合了 RoPE 旋转位置编码，之后利用残差连接和原始输入相加。
+3. **前馈神经网络**：随后再度进行一次 `RMSNorm` 处理，输入包含门控机制的 SwiGLU 风格前馈神经网络（FFN），最后进行第二次残差连接。
+
+*(推理阶段，模型内部引入了 `past_key_values`，完整支持 KV Cache 的存取，以大幅加速单步文本生成效率。)*
 
 当前实现的关键点：
 
 - Pre-Norm Transformer Block
-- RoPE 位置编码，并预留 YaRN 长上下文外推能力
-- GQA 注意力机制
-- SwiGLU 风格 FFN
-- `embed_tokens.weight` 与 `lm_head.weight` 权重共享
+- RoPE 旋转位置编码，预留 YaRN 长上下文外推能力
+- GQA 分组查询注意力机制（在计算开销与效果间取得更佳平衡）
+- 基于 SiLU 的 SwiGLU 风格可学习门控 FFN
+- `embed_tokens.weight` 与 `lm_head.weight` 词表权重共享
 
 ## 预训练快速开始
 
@@ -83,6 +105,3 @@ torchrun --nproc_per_node=2 train_pretrain.py --data_path ../dataset/pretrain_hq
 - 当前脚本默认使用 `bfloat16` 自动混合精度。
 - `--use_moe` 目前仅保留为兼容参数，当前训练固定使用普通 FFN，不启用 MoE。
 
-## 学习资料
-
-如果想看更详细的推导、代码逐段解释和工程实践记录，可以直接阅读 [doc/学习日志.md](doc/学习日志.md)。
