@@ -4,9 +4,9 @@
 小白如何学会并使用 minimind？本项目将为你提供答案。
 
 - 参考项目：[minimind](https://github.com/jingyaogong/minimind)
-- 参考视频：[Bilibili: 2小时带你从0手搓一个能在笔记本上运行的GPT大模型](https://www.bilibili.com/video/BV1T2k6BaEeC/?share_source=copy_web&vd_source=2fca6e2667a11ddcb7554d3ef302d0ff)
+- 主要参考视频：[Bilibili: Only三小时！Pytorch从零手敲大模型，架构到训练全教程](https://www.bilibili.com/video/BV1T2k6BaEeC/?share_source=copy_web&vd_source=2fca6e2667a11ddcb7554d3ef302d0ff)
 
-本项目致力于提供一条清晰、极简的大语言模型（LLM）学习与落地路径。项目深度参考了优秀的开源工程 MiniMind 及其配套教学视频。
+本项目致力于提供一条清晰、极简的大语言模型（LLM）学习与落地路径。项目深度参考了优秀的开源工程 MiniMind、b站相关教学视频。
 
 与单纯的代码复现不同，本项目最大的特色在于系统性地补齐了原项目背后的底层基础知识（涵盖 Transformer 架构细节、RoPE 位置编码、KV Cache 机制以及 SwiGLU 等核心组件）。旨在帮助学习者跨越理论壁垒，不仅能把代码“跑通”，更能真正透彻掌握模型原理，从底层逻辑出发，亲手搭建出完全属于自己的大模型。
 
