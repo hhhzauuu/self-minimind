@@ -26,7 +26,6 @@ def init_model(args):
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}.pth'
         
         # 加载模型权重到模型实例中
-        # 
         model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
         # if args.lora_weight != 'None':
         #     apply_lora(model)
