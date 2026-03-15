@@ -5,7 +5,7 @@ import warnings
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.self_minimind import SelfMiniMindConfig, SelfMiniMindForCausalLM
-# from model.model_lora import *
+from model.model_lora import *
 from trainer.trainer_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
 
@@ -22,14 +22,15 @@ def init_model(args):
         # moe_suffix = '_moe' if args.use_moe else ''
         # ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
 
-        # 拼接本地 .pth 权重文件的路径，根据用户输入的参数来确定具体的文件名
-        ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}.pth'
-        
+        # 拼接底座模型路径：如果权重名包含sft则在sft目录下，包含pretrain则在pretrain目录下
+        task_dir = 'sft' if 'sft' in args.weight else ('pretrain' if 'pretrain' in args.weight else '')
+        ckp = f'{args.save_dir}/{task_dir}/{args.weight}_{args.hidden_size}.pth' if task_dir else f'{args.save_dir}/{args.weight}_{args.hidden_size}.pth'
+
         # 加载模型权重到模型实例中
         model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
-        # if args.lora_weight != 'None':
-        #     apply_lora(model)
-        #     load_lora(model, f'./{args.save_dir}/lora/{args.lora_weight}_{args.hidden_size}.pth')
+        if args.lora_weight != 'None':
+            apply_lora(model)
+            load_lora(model, f'{args.save_dir}/lora/{args.lora_weight}_{args.hidden_size}.pth')
 
     # 如果不是本地model路径，就直接用transformers库的AutoModelForCausalLM从指定路径加载模型，注意这个不是用我们的模型架构了
     else:
@@ -43,7 +44,7 @@ def main():
     parser.add_argument('--save_dir', default='out', type=str, help="模型权重目录")
     parser.add_argument('--weight', default='sft', type=str, help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）")
     parser.add_argument('--lora_weight', default='None', type=str, help="LoRA权重名称（None表示不使用，可选：lora_identity, lora_medical）")
-    parser.add_argument('--hidden_size', default=512, type=int, help="隐藏层维度（512=Small-26M, 640=MoE-145M, 768=Base-104M）")
+    parser.add_argument('--hidden_size', default=512, type=int, help="隐藏层维度（为0则使用默认（512=Small-26M, 640=MoE-145M, 768=Base-104M）")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量（Small/MoE=8, Base=16）")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--inference_rope_scaling', default=False, action='store_true', help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")

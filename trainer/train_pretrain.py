@@ -27,7 +27,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):#start_step 表�
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device) #把输入数据和标签都放到gpu
         labels = labels.to(args.device)
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate, args.warmup_steps) # 余弦退火学习率+warmup
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate, args.warmup_ratio) # 余弦退火学习率+warmup
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr #更新优化器的学习率
 
@@ -82,11 +82,11 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):#start_step 表�
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SelfMiniMind Pretraining")
-    parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
+    parser.add_argument("--save_dir", type=str, default="../out/pretrain", help="模型保存目录")
     parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数（建议1轮zero或2-6轮充分训练）")
-    parser.add_argument("--warmup_steps", type=int, default=100, help="学习率预热步数")
-    parser.add_argument("--batch_size", type=int, default=128, help="batch size")
+    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="学习率预热比例")
+    parser.add_argument("--batch_size", type=int, default=64, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")

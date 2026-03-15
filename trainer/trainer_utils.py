@@ -38,10 +38,11 @@ def Logger(content):
         print(content)
 
 
-def get_lr(current_step, total_steps, lr, warmup_steps=0):
-    if current_step < warmup_steps:
-        return lr * (current_step / warmup_steps)
-    return lr*(0.1 + 0.45*(1 + math.cos(math.pi * (current_step - warmup_steps) / (total_steps - warmup_steps))))
+def get_lr(current_step, total_steps, lr, warmup_ratio=0.0):
+    warmup_iters = total_steps * warmup_ratio
+    if current_step < warmup_iters:
+        return lr * (current_step / warmup_iters)
+    return lr*(0.1 + 0.45*(1 + math.cos(math.pi * (current_step - warmup_iters) / (total_steps - warmup_iters))))
 
 
 def init_distributed_mode():
