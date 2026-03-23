@@ -2,7 +2,7 @@ from modelscope.hub.file_download import dataset_file_download
 
 file_path = dataset_file_download(
     dataset_id='gongjy/minimind_dataset',
-    file_path='lora_medical.jsonl',
+    file_path='rlaif-mini.jsonl',
     local_dir='./dataset'
 )
 
